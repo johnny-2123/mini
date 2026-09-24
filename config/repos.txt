@@ -1,0 +1,3 @@
+/Users/johnnyavila/Developer/salesably-app
+/Users/johnnyavila/Developer/gtm-tools
+/Users/johnnyavila/Documents/Mateo/mateo-episode-studio

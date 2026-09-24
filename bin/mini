@@ -5,8 +5,12 @@
 set -euo pipefail
 
 export PATH="/opt/homebrew/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
-MINI_HOST="${MINI_HOST:-johnnyavila@mac-mini}"
 MINI_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# Which mini to use and which repos live on it are committed to this repo, so
+# a new MacBook or a replacement mini can be set up from a fresh clone.
+HOST_FILE="$MINI_DIR/config/host"
+REPOS_FILE="$MINI_DIR/config/repos.txt"
+MINI_HOST="${MINI_HOST:-$(cat "$HOST_FILE")}"
 STATE="$HOME/.mini"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=auto
   -o "ControlPath=$HOME/.ssh/cm-%r@%h:%p" -o ControlPersist=10m)
@@ -256,8 +260,13 @@ install_deps() {
 
 cmd_add_repo() {
   local env_only="" path="" a
-  for a in "$@"; do case "$a" in --env-only) env_only=1 ;; *) path="$a" ;; esac; done
+  for a in "$@"; do case "$a" in --env-only) env_only=1 ;; --all) path=--all ;; *) path="$a" ;; esac; done
   is_host && die "run add-repo on the MacBook — it copies from there"
+  if [[ "$path" == --all ]]; then
+    [[ -s "$REPOS_FILE" ]] || die "no repos listed in $REPOS_FILE"
+    while IFS= read -r a; do cmd_add_repo "$a" ${env_only:+--env-only} < /dev/null; done < "$REPOS_FILE"
+    return
+  fi
   local repo url branch; repo="$(repo_root "${path:-.}")"
   url="$(git -C "$repo" remote get-url origin)" || die "$repo has no origin remote"
   branch="$(git -C "$repo" branch --show-current)"
@@ -268,8 +277,10 @@ cmd_add_repo() {
     on_mini "set -e; r=$(q "$repo")
       if [ -e \"\$r\" ]; then mv \"\$r\" \"\$HOME/.Trash/\$(basename \"\$r\")-old-\$(date +%Y%m%d%H%M%S)\"; echo '  old copy moved to the mini Trash'; fi
       mkdir -p \"\$(dirname \"\$r\")\"; git clone -q $(q "$url") \"\$r\"
-      cd \"\$r\"; git checkout -q $(q "$branch") 2>/dev/null || true
-      grep -qxF \"\$r\" \$HOME/.mini/repos 2>/dev/null || echo \"\$r\" >> \$HOME/.mini/repos"
+      cd \"\$r\"; git checkout -q $(q "$branch") 2>/dev/null || true"
+  fi
+  if ! grep -qxF "$repo" "$REPOS_FILE"; then
+    echo "$repo" >> "$REPOS_FILE"; save_config "$REPOS_FILE" "Add $(basename "$repo") to the mini"
   fi
   say "copying gitignored config (env files, local settings)"
   copy_ignored "$repo" "$MINI_HOST:$repo"
@@ -278,27 +289,57 @@ cmd_add_repo() {
   say "$(basename "$repo") is ready on the mini"
 }
 
-cmd_repos() { on_mini 'cat $HOME/.mini/repos 2>/dev/null || true'; }
+cmd_repos() { cat "$REPOS_FILE" 2>/dev/null || true; }
 
 # ---------------------------------------------------------------- config
 # Mirror agent config: config/home-paths.txt, Claude memory, user MCP servers,
 # git identity, and Claude's trust for every repo on the mini.
 cmd_sync_config() {
   is_host && die "run sync-config on the MacBook"
+  if [[ "${1:-}" == --from-mini ]]; then pull_config; return; fi
   say "syncing agent config"
-  # A file list, not -R: macOS's openrsync ignores the /./ marker -R needs.
-  local p list; list="$(mktemp)"
-  while IFS= read -r p; do if [[ -e "$HOME/$p" ]]; then echo "$p"; fi; done < <(config_list home-paths.txt) > "$list"
+  local list; list="$(home_list)"
   to_mini -r --files-from="$list" "$HOME/" "$MINI_HOST:"
   rm -f "$list"
   to_mini -m --include='*/' --include='*/memory/***' --exclude='*' \
     "$HOME/.claude/projects/" "$MINI_HOST:.claude/projects/"
   python3 "$MINI_DIR/lib/claude-json.py" export-mcp |
-    ssh "${SSH_OPTS[@]}" "$MINI_HOST" 'j=$HOME/Developer/mini/lib/claude-json.py; python3 $j merge-mcp && python3 $j trust $(cat $HOME/.mini/repos 2>/dev/null)'
+    ssh "${SSH_OPTS[@]}" "$MINI_HOST" 'j=$HOME/Developer/mini/lib/claude-json.py; python3 $j merge-mcp && python3 $j trust $(cat $HOME/Developer/mini/config/repos.txt)'
   local k v
   while IFS='=' read -r k v; do
     [[ "$k" == credential.* ]] || on_mini "git config --global $(q "$k" "$v")"
   done < <(git config --global --list)
+}
+
+# home-paths.txt entries that exist (here, or in the list given), written to a
+# temp file for rsync --files-from. A file list, not -R: macOS's openrsync
+# ignores the /./ marker -R needs.
+home_list() {
+  local list p; list="$(mktemp)"
+  while IFS= read -r p; do
+    if [[ -n "${1+x}" ]]; then grep -qxF "$p" <<< "$1" && echo "$p"
+    elif [[ -e "$HOME/$p" ]]; then echo "$p"; fi
+  done < <(config_list home-paths.txt) > "$list"
+  echo "$list"
+}
+
+# The reverse, for a new MacBook: copy the mini's agent config, memory and
+# MCP servers here. Git identity and logins stay per machine.
+pull_config() {
+  say "copying agent config from the mini to this MacBook"
+  local list; list="$(home_list "$(on_mini "cd \$HOME && ls -d $(config_list home-paths.txt | tr '\n' ' ') 2>/dev/null || true")")"
+  to_mini -r --files-from="$list" "$MINI_HOST:" "$HOME/"
+  rm -f "$list"
+  to_mini -m --include='*/' --include='*/memory/***' --exclude='*' \
+    "$MINI_HOST:.claude/projects/" "$HOME/.claude/projects/"
+  ssh "${SSH_OPTS[@]}" "$MINI_HOST" 'python3 $HOME/Developer/mini/lib/claude-json.py export-mcp' |
+    python3 "$MINI_DIR/lib/claude-json.py" merge-mcp
+}
+
+# Commit and push a config file change so every machine's clone has it.
+save_config() {
+  git -C "$MINI_DIR" add "$1" && git -C "$MINI_DIR" commit -qm "$2" -- "$1" &&
+    git -C "$MINI_DIR" push -q || echo "  (couldn't push $1 — commit it in $MINI_DIR)"
 }
 
 link() { mkdir -p "$(dirname "$2")"; ln -sfn "$1" "$2"; }
@@ -311,8 +352,22 @@ link_skills() {
   done
 }
 
+# Tools the mini must already have; setup installs gh and the rest itself.
+check_prereqs() {
+  local missing
+  missing="$(on_mini 'for c in brew git node pnpm claude codex screen; do [ -x /opt/homebrew/bin/$c ] || command -v $c >/dev/null || printf "%s " $c; done')"
+  [[ -z "$missing" ]] || die "the mini is missing: $missing— install them there (Homebrew first: https://brew.sh), then re-run mini setup"
+}
+
 cmd_setup() {
   is_host && die "run setup on the MacBook"
+  if [[ -n "${1:-}" ]]; then
+    MINI_HOST="$1"; echo "$MINI_HOST" > "$HOST_FILE"
+    save_config "$HOST_FILE" "Send tasks to $MINI_HOST"
+    say "tasks now go to $MINI_HOST"
+  fi
+  on_mini true || die "can't ssh to $MINI_HOST — see the README's \"New Mac mini\" steps"
+  check_prereqs
   say "linking mini and its skills on this MacBook"
   link "$MINI_DIR/bin/mini" /opt/homebrew/bin/mini
   link_skills
@@ -373,10 +428,14 @@ mini — run Claude or Codex tasks on the Mac mini
   mini stop ID             end a task
   mini clean               remove finished tasks' worktrees with no uncommitted work
 
-  mini add-repo [PATH] [--env-only]   recreate a repo on the mini with its env files
-  mini repos                          repos set up on the mini
-  mini sync-config                    re-copy agent config, skills and memory
-  mini setup                          one-time setup (safe to re-run)
+  mini add-repo [PATH|--all] [--env-only]
+                           recreate a repo (or every listed repo) on the mini
+  mini repos               repos this MacBook keeps on the mini
+  mini sync-config [--from-mini]
+                           copy agent config, skills and memory to the mini
+                           (--from-mini: the other way, for a new MacBook)
+  mini link                put mini and its skills on this machine's PATH
+  mini setup [USER@HOST]   set up a mini (safe to re-run); a host switches to a new mini
 
 Defaults: the agent you're in, its current model and effort, the repo you're
 in, and the branch you're on (when it's on origin).
@@ -394,8 +453,9 @@ case "$sub" in
   clean) cmd_clean ;;
   add-repo) cmd_add_repo "$@" ;;
   repos) cmd_repos ;;
-  sync-config) cmd_sync_config ;;
-  setup) cmd_setup ;;
+  sync-config) cmd_sync_config "$@" ;;
+  link) link "$MINI_DIR/bin/mini" /opt/homebrew/bin/mini; link_skills; say "mini and its skills are linked on this machine" ;;
+  setup) cmd_setup "$@" ;;
   _dispatch) cmd__dispatch ;;
   _run) cmd__run "$@" ;;
   _install) install_deps "$@" ;;
