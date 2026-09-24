@@ -1,0 +1,19 @@
+# Gitignored paths `mini add-repo` never copies (extended regex, one per line).
+# Everything else that git ignores — .env files, local settings — is copied,
+# unless it's over MINI_MAX_IGNORED_MB (default 50).
+(^|/)node_modules(/|$)
+(^|/)\.next(/|$)
+(^|/)\.turbo(/|$)
+(^|/)\.cache(/|$)
+(^|/)\.vercel/output(/|$)
+(^|/)(dist|build|out|coverage)(/|$)
+(^|/)(test-results|playwright-report|blob-report)(/|$)
+(^|/)(\.venv|venv|__pycache__)(/|$)
+(^|/)\.DS_Store$
+\.log$
+\.tsbuildinfo$
+(^|/)\.pnpm-store(/|$)
+(^|/)(\.worktrees|\.claude/worktrees)(/|$)
+(^|/)\.claude/scheduled_tasks\.lock$
+(^|/)\.gradle(/|$)
+(^|/)xcuserdata(/|$)

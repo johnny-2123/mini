@@ -1,0 +1,28 @@
+# Paths under ~ that `mini sync-config` copies to the same place on the mini.
+# Missing ones are skipped. Claude memory (~/.claude/projects/*/memory) and
+# user MCP servers are synced separately. Logins are not copied: Claude and
+# Codex sign in on the mini itself, and setup signs gh in.
+
+# Claude Code
+.claude/settings.json
+.claude/settings.local.json
+.claude/CLAUDE.md
+.claude/keybindings.json
+.claude/skills
+.claude/agents
+.claude/commands
+.claude/plugins
+
+# Codex
+.codex/config.toml
+.codex/AGENTS.md
+.codex/rules
+.codex/skills
+
+# Skills both tools share
+.agents
+
+# CLI config some repos' scripts use
+.config/neonctl
+.config/stripe
+.config/salesably-sdr

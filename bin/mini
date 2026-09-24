@@ -1,0 +1,405 @@
+#!/usr/bin/env bash
+# mini — send coding tasks from the MacBook to the Mac mini, and keep the
+# mini's repos and agent config in step with the MacBook.
+# Every command runs on the MacBook (over ssh) or on the mini itself.
+set -euo pipefail
+
+export PATH="/opt/homebrew/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
+MINI_HOST="${MINI_HOST:-johnnyavila@mac-mini}"
+MINI_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+STATE="$HOME/.mini"
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=auto
+  -o "ControlPath=$HOME/.ssh/cm-%r@%h:%p" -o ControlPersist=10m)
+MAX_IGNORED_MB="${MINI_MAX_IGNORED_MB:-50}"
+
+die() { echo "mini: $*" >&2; exit 1; }
+say() { echo "▸ $*"; }
+is_host() { [[ -f "$STATE/is-host" ]]; }
+# Shell-quote arguments for a command string run on the mini.
+q() { local out; printf -v out '%q ' "$@"; printf '%s' "${out% }"; }
+
+# Run a command string on the mini (locally when already on it).
+on_mini() { if is_host; then bash -c "$1"; else ssh "${SSH_OPTS[@]}" "$MINI_HOST" "$1"; fi; }
+on_mini_tty() { if is_host; then bash -c "$1"; else ssh -t "${SSH_OPTS[@]}" "$MINI_HOST" "$1"; fi; }
+# Run a mini subcommand on the mini.
+mini_there() { on_mini "\$HOME/Developer/mini/bin/mini $(q "$@")"; }
+# rsync to the mini over the shared ssh connection.
+to_mini() { rsync -a -e "ssh ${SSH_OPTS[*]}" "$@"; }
+
+repo_root() { git -C "${1:-.}" rev-parse --show-toplevel 2>/dev/null || die "${1:-.} is not inside a git repo"; }
+config_list() { grep -vE '^\s*(#|$)' "$MINI_DIR/config/$1"; }
+
+# ---------------------------------------------------------------- defaults
+# Model and effort a tool is set to right now, read from its own config.
+toml_top() { awk -F' *= *' -v k="$2" '/^\[/{exit} $1==k{gsub(/"/,"",$2); print $2}' "$1" 2>/dev/null || true; }
+json_key() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2],""))' "$1" "$2" 2>/dev/null || true; }
+default_model() {
+  case "$1" in
+    claude) json_key "$HOME/.claude/settings.json" model ;;
+    codex) toml_top "$HOME/.codex/config.toml" model ;;
+  esac
+}
+default_effort() {
+  case "$1" in
+    claude) json_key "$HOME/.claude/settings.json" effortLevel ;;
+    codex) toml_top "$HOME/.codex/config.toml" model_reasoning_effort ;;
+  esac
+}
+detect_agent() {
+  if [[ -n "${CLAUDECODE:-}" ]]; then echo claude
+  elif [[ -n "${CODEX_THREAD_ID:-}${CODEX_SANDBOX:-}${CODEX_MANAGED_BY_NPM:-}" ]]; then echo codex
+  else die "can't tell whether this is Claude or Codex; pass --agent claude|codex"; fi
+}
+
+# ---------------------------------------------------------------- send
+cmd_send() {
+  local agent="" model="" effort="" repo="" branch="" title="" prompt=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --agent) agent="$2"; shift 2 ;;
+      --model) model="$2"; shift 2 ;;
+      --effort) effort="$2"; shift 2 ;;
+      --repo) repo="$2"; shift 2 ;;
+      --branch) branch="$2"; shift 2 ;;
+      --title) title="$2"; shift 2 ;;
+      -) prompt="$(cat)"; shift ;;
+      --) shift; prompt="$*"; break ;;
+      -*) die "unknown option $1" ;;
+      *) prompt="$*"; break ;;
+    esac
+  done
+  [[ -n "$prompt" ]] || die 'no task given: mini send "what to do"'
+  agent="${agent:-$(detect_agent)}"
+  [[ "$agent" == claude || "$agent" == codex ]] || die "--agent must be claude or codex"
+  model="${model:-$(default_model "$agent")}"
+  effort="${effort:-$(default_effort "$agent")}"
+  repo="$(repo_root "${repo:-.}")"
+  if [[ -z "$branch" ]]; then
+    branch="$(git -C "$repo" branch --show-current)"
+    # Only follow this checkout's branch when the mini can fetch it.
+    git -C "$repo" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1 || branch=""
+  fi
+  title="${title:-$(printf '%s' "$prompt" | tr '\n' ' ' | cut -c1-60)}"
+  local slug id
+  slug="$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | cut -c1-24 | sed 's/^-*//;s/-*$//')"
+  id="$(date +%m%d-%H%M%S)-${slug:-task}"
+
+  on_mini "test -d $(q "$repo")/.git" || die "$repo isn't on the mini yet — run: mini add-repo $repo"
+  is_host || cmd_push_self
+
+  local dir; dir="$(mktemp -d)"
+  printf '%s\n' "$prompt" > "$dir/prompt.md"
+  {
+    printf 'AGENT=%q\nMODEL=%q\nEFFORT=%q\nREPO=%q\n' "$agent" "$model" "$effort" "$repo"
+    printf 'BRANCH=%q\nTITLE=%q\n' "$branch" "$title"
+  } > "$dir/meta"
+  if is_host; then mkdir -p "$STATE/tasks/$id"; cp "$dir"/* "$STATE/tasks/$id/"
+  else to_mini "$dir/" "$MINI_HOST:.mini/tasks/$id/"; fi
+  rm -rf "$dir"
+  on_mini "touch \$HOME/.mini/queue/$(q "$id")"
+
+  say "sent to the mini as $id"
+  echo "  $agent · model ${model:-default} · effort ${effort:-default} · $(basename "$repo")${branch:+ @ $branch}"
+  echo "  watch: mini attach $id   ·   status: mini ls   ·   summary: mini result $id"
+  if [[ "$agent" == claude ]]; then echo "  also in the Claude app under Code as \"mini: $title\""; fi
+}
+
+# Keep the mini's copy of this tool identical to the MacBook's.
+cmd_push_self() { to_mini --delete --exclude .DS_Store "$MINI_DIR/" "$MINI_HOST:Developer/mini/"; }
+
+# ---------------------------------------------------------------- tasks on the mini
+# launchd runs this from the mini's desktop session whenever ~/.mini/queue has
+# files, so each agent can read the login keychain (ssh sessions can't).
+cmd__dispatch() {
+  local f id
+  for f in "$STATE"/queue/*; do
+    [[ -e "$f" ]] || continue
+    id="$(basename "$f")"; rm -f "$f"
+    [[ -f "$STATE/tasks/$id/meta" ]] || continue
+    echo preparing > "$STATE/tasks/$id/state"
+    screen -c "$MINI_DIR/config/screenrc" -dmS "mini-$id" \
+      /bin/zsh -lc "$(q "$MINI_DIR/bin/mini" _run "$id")"
+  done
+}
+
+# screen -ls exits 1 whenever sessions exist.
+running_ids() { { screen -ls 2>/dev/null || true; } | sed -nE 's/^[[:space:]]*[0-9]+\.mini-([^[:space:]]+).*/\1/p'; }
+
+cmd__run() {
+  local id="$1" task="$STATE/tasks/$1" AGENT MODEL EFFORT REPO BRANCH TITLE
+  # shellcheck disable=SC1091
+  source "$task/meta"
+  fail() { echo "failed: $*" | tee -a "$task/prep.log"; echo failed > "$task/state"; sleep 600; exit 1; }
+  log() { "$@" 2>&1 | tee -a "$task/prep.log"; }
+  cd "$REPO" || fail "$REPO is missing"
+  say "updating $(basename "$REPO")" | tee "$task/prep.log"
+  log git fetch --prune -q origin || fail "git fetch failed"
+  BRANCH="${BRANCH:-$(git branch --show-current)}"
+
+  local workdir="$REPO" other busy=""
+  for other in $(running_ids); do
+    if [[ "$other" != "$id" ]] && grep -qxF "WORKDIR=$(printf %q "$REPO")" "$STATE/tasks/$other/meta" 2>/dev/null; then
+      busy="task $other is using it"
+    fi
+  done
+  if [[ -z "$busy" && -n "$(git status --porcelain)" ]]; then busy="it has uncommitted changes"; fi
+  if [[ -z "$busy" ]]; then
+    { log git checkout -q "$BRANCH" && log git pull --ff-only -q origin "$BRANCH"; } || busy="it can't fast-forward to origin/$BRANCH"
+  fi
+  if [[ -n "$busy" ]]; then
+    workdir="$STATE/worktrees/$id"
+    say "main checkout skipped ($busy); using worktree $workdir on branch mini/$id" | tee -a "$task/prep.log"
+    log git worktree add -q -B "mini/$id" "$workdir" "origin/$BRANCH" || fail "git worktree add failed"
+    log copy_ignored "$REPO" "$workdir"
+  fi
+  printf 'WORKDIR=%q\n' "$workdir" >> "$task/meta"
+  log install_deps "$workdir"
+  python3 "$MINI_DIR/lib/claude-json.py" trust "$workdir"
+
+  local prompt
+  prompt="$(cat <<EOF
+[Sent from the MacBook with \`mini send\`. You're running on the Mac mini in $workdir, branch $(git -C "$workdir" branch --show-current), freshly updated from origin. Nobody is watching live: don't stop to ask questions — make the reasonable call and note it. Follow this repo's own rules for branches, commits, pushes and PRs. When you're done, write a short summary to $task/result.md: what changed, the branch / commits / PR, and anything left for me to check.]
+
+$(cat "$task/prompt.md")
+EOF
+)"
+  echo running > "$task/state"
+  cd "$workdir"
+  # Neither agent stops for approval: Claude in auto mode, Codex in yolo mode.
+  local args=()
+  case "$AGENT" in
+    claude)
+      if [[ -n "$MODEL" ]]; then args+=(--model "$MODEL"); fi
+      if [[ -n "$EFFORT" ]]; then args+=(--effort "$EFFORT"); fi
+      # --no-chrome: an unattended task must not drive the mini's browser,
+      # and asking about it stalls the task at startup.
+      claude "${args[@]}" --permission-mode auto --no-chrome --name "mini: $TITLE" \
+        --remote-control="mini: $TITLE" "$prompt" || true ;;
+    codex)
+      if [[ -n "$MODEL" ]]; then args+=(-m "$MODEL"); fi
+      if [[ -n "$EFFORT" ]]; then args+=(-c "model_reasoning_effort=\"$EFFORT\""); fi
+      codex "${args[@]}" --dangerously-bypass-approvals-and-sandbox \
+        -c "projects.\"$workdir\".trust_level=\"trusted\"" "$prompt" || true ;;
+  esac
+  echo exited > "$task/state"
+}
+
+cmd_ls() {
+  if ! is_host; then mini_there ls "$@"; return; fi
+  local running id meta state
+  running=" $(running_ids | tr '\n' ' ') "
+  printf '%-36s %-7s %-9s %-22s %s\n' ID AGENT STATE REPO TASK
+  for meta in $(ls -1dt "$STATE"/tasks/*/meta 2>/dev/null | head -"${1:-15}"); do
+    id="$(basename "$(dirname "$meta")")"
+    ( source "$meta"
+      state="$(cat "$STATE/tasks/$id/state" 2>/dev/null || echo queued)"
+      if [[ "$running" != *" $id "* && ( "$state" == running || "$state" == preparing ) ]]; then state=stopped; fi
+      if [[ -f "$STATE/tasks/$id/result.md" ]]; then state="done"; fi
+      printf '%-36s %-7s %-9s %-22s %s\n' "$id" "$AGENT" "$state" "$(basename "$REPO")" "$TITLE" )
+  done
+}
+
+latest_id() { on_mini 'ls -1t $HOME/.mini/tasks | head -1'; }
+cmd_attach() { local id="${1:-$(latest_id)}"; echo "(detach with Ctrl-A then D)"; on_mini_tty "screen -r mini-$(q "$id")"; }
+cmd_log() { local id="${1:-$(latest_id)}"; on_mini "cat \$HOME/.mini/tasks/$(q "$id")/prep.log"; }
+cmd_result() { local id="${1:-$(latest_id)}"; on_mini "cat \$HOME/.mini/tasks/$(q "$id")/result.md 2>/dev/null || echo 'no summary yet — mini attach $id'"; }
+cmd_stop() { [[ -n "${1:-}" ]] || die "mini stop <id>"; on_mini "screen -S mini-$(q "$1") -X quit"; say "stopped $1"; }
+
+# Remove worktrees of finished tasks that hold no uncommitted work.
+cmd_clean() {
+  if ! is_host; then mini_there clean; return; fi
+  local wt id running; running=" $(running_ids | tr '\n' ' ') "
+  for wt in "$STATE"/worktrees/*; do
+    [[ -d "$wt" ]] || continue
+    id="$(basename "$wt")"
+    [[ "$running" == *" $id "* ]] && continue
+    if [[ -z "$(git -C "$wt" status --porcelain)" ]]; then
+      git -C "$wt" worktree remove "$wt" && say "removed worktree $id"
+    else say "kept $id (uncommitted changes)"; fi
+  done
+}
+
+# ---------------------------------------------------------------- repos
+# Gitignored files worth copying: env files, local settings, keys. Skips
+# build output (config/skip-ignored.txt) and anything over MAX_IGNORED_MB.
+ignored_files() {
+  local root="$1" skip entry kb
+  skip="$(config_list skip-ignored.txt | paste -sd'|' -)"
+  git -C "$root" ls-files --others --ignored --exclude-standard --directory | sed 's:/$::' |
+    { grep -vE "$skip" || true; } | while IFS= read -r entry; do
+      kb="$(du -sk "$root/$entry" | cut -f1)"
+      if (( kb > MAX_IGNORED_MB * 1024 )); then echo "  skipped $entry ($((kb / 1024)) MB)" >&2
+      else echo "$entry"; fi
+    done
+}
+
+# copy_ignored SRC DST — DST is a local path or HOST:PATH.
+copy_ignored() {
+  local src="$1" dst="$2" list; list="$(mktemp)"
+  ignored_files "$src" > "$list"
+  if [[ "$dst" == *:* ]]; then to_mini -r --files-from="$list" "$src/" "$dst/"
+  else rsync -a -r --files-from="$list" "$src/" "$dst/"; fi
+  sed 's/^/  copied /' "$list"; rm -f "$list"
+}
+
+install_deps() {
+  local d="$1"
+  [[ -f "$d/package.json" ]] || return 0
+  say "installing dependencies"
+  ( cd "$d"
+    if [[ -f pnpm-lock.yaml ]]; then pnpm install --frozen-lockfile || pnpm install
+    elif [[ -f bun.lock || -f bun.lockb ]]; then bun install
+    elif [[ -f yarn.lock ]]; then yarn install --frozen-lockfile
+    elif [[ -f package-lock.json ]]; then npm ci
+    else npm install; fi )
+}
+
+cmd_add_repo() {
+  local env_only="" path="" a
+  for a in "$@"; do case "$a" in --env-only) env_only=1 ;; *) path="$a" ;; esac; done
+  is_host && die "run add-repo on the MacBook — it copies from there"
+  local repo url branch; repo="$(repo_root "${path:-.}")"
+  url="$(git -C "$repo" remote get-url origin)" || die "$repo has no origin remote"
+  branch="$(git -C "$repo" branch --show-current)"
+  cmd_push_self
+
+  if [[ -z "$env_only" ]]; then
+    say "recreating $repo on the mini from $url"
+    on_mini "set -e; r=$(q "$repo")
+      if [ -e \"\$r\" ]; then mv \"\$r\" \"\$HOME/.Trash/\$(basename \"\$r\")-old-\$(date +%Y%m%d%H%M%S)\"; echo '  old copy moved to the mini Trash'; fi
+      mkdir -p \"\$(dirname \"\$r\")\"; git clone -q $(q "$url") \"\$r\"
+      cd \"\$r\"; git checkout -q $(q "$branch") 2>/dev/null || true
+      grep -qxF \"\$r\" \$HOME/.mini/repos 2>/dev/null || echo \"\$r\" >> \$HOME/.mini/repos"
+  fi
+  say "copying gitignored config (env files, local settings)"
+  copy_ignored "$repo" "$MINI_HOST:$repo"
+  cmd_sync_config
+  if [[ -z "$env_only" ]]; then mini_there _install "$repo"; fi
+  say "$(basename "$repo") is ready on the mini"
+}
+
+cmd_repos() { on_mini 'cat $HOME/.mini/repos 2>/dev/null || true'; }
+
+# ---------------------------------------------------------------- config
+# Mirror agent config: config/home-paths.txt, Claude memory, user MCP servers,
+# git identity, and Claude's trust for every repo on the mini.
+cmd_sync_config() {
+  is_host && die "run sync-config on the MacBook"
+  say "syncing agent config"
+  # A file list, not -R: macOS's openrsync ignores the /./ marker -R needs.
+  local p list; list="$(mktemp)"
+  while IFS= read -r p; do if [[ -e "$HOME/$p" ]]; then echo "$p"; fi; done < <(config_list home-paths.txt) > "$list"
+  to_mini -r --files-from="$list" "$HOME/" "$MINI_HOST:"
+  rm -f "$list"
+  to_mini -m --include='*/' --include='*/memory/***' --exclude='*' \
+    "$HOME/.claude/projects/" "$MINI_HOST:.claude/projects/"
+  python3 "$MINI_DIR/lib/claude-json.py" export-mcp |
+    ssh "${SSH_OPTS[@]}" "$MINI_HOST" 'j=$HOME/Developer/mini/lib/claude-json.py; python3 $j merge-mcp && python3 $j trust $(cat $HOME/.mini/repos 2>/dev/null)'
+  local k v
+  while IFS='=' read -r k v; do
+    [[ "$k" == credential.* ]] || on_mini "git config --global $(q "$k" "$v")"
+  done < <(git config --global --list)
+}
+
+link() { mkdir -p "$(dirname "$2")"; ln -sfn "$1" "$2"; }
+link_skills() {
+  local s
+  for s in "$MINI_DIR"/skills/*/; do
+    s="$(basename "$s")"
+    link "$MINI_DIR/skills/$s" "$HOME/.claude/skills/$s"
+    link "$MINI_DIR/skills/$s" "$HOME/.codex/skills/$s"
+  done
+}
+
+cmd_setup() {
+  is_host && die "run setup on the MacBook"
+  say "linking mini and its skills on this MacBook"
+  link "$MINI_DIR/bin/mini" /opt/homebrew/bin/mini
+  link_skills
+  say "copying mini to $MINI_HOST"
+  on_mini 'mkdir -p $HOME/Developer/mini $HOME/.mini/queue $HOME/.mini/tasks $HOME/.mini/worktrees'
+  cmd_push_self
+  on_mini 'touch $HOME/.mini/is-host; ln -sfn $HOME/Developer/mini/bin/mini /opt/homebrew/bin/mini'
+  if ! on_mini 'test -x /opt/homebrew/bin/gh'; then
+    say "installing gh on the mini"
+    local tmp; tmp="$(mktemp -d)"
+    gh release download --repo cli/cli --pattern '*macOS_arm64.zip' --dir "$tmp"
+    to_mini "$tmp"/*.zip "$MINI_HOST:.mini/gh.zip"; rm -rf "$tmp"
+    on_mini 'set -e; cd $HOME/.mini; rm -rf gh-cli; mkdir gh-cli; unzip -q gh.zip -d gh-cli; rm gh.zip
+      ln -sfn "$(ls -d $HOME/.mini/gh-cli/*/bin/gh)" /opt/homebrew/bin/gh'
+  fi
+  if ! on_mini '/opt/homebrew/bin/gh auth status >/dev/null 2>&1'; then
+    say "signing gh in on the mini"
+    gh auth token | ssh "${SSH_OPTS[@]}" "$MINI_HOST" '/opt/homebrew/bin/gh auth login --with-token --insecure-storage'
+  fi
+  on_mini '/opt/homebrew/bin/gh auth setup-git'
+  mini_there _install-agent
+  cmd_sync_config
+  say "setup done — add repos with: mini add-repo <path>"
+}
+
+# LaunchAgent: start queued tasks from the mini's desktop session.
+cmd__install_agent() {
+  local plist="$HOME/Library/LaunchAgents/dev.mini.dispatch.plist"
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>dev.mini.dispatch</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/zsh</string><string>-lc</string><string>$MINI_DIR/bin/mini _dispatch</string>
+  </array>
+  <key>QueueDirectories</key><array><string>$STATE/queue</string></array>
+  <key>AbandonProcessGroup</key><true/>
+  <key>StandardOutPath</key><string>$STATE/dispatch.log</string>
+  <key>StandardErrorPath</key><string>$STATE/dispatch.log</string>
+</dict></plist>
+EOF
+  launchctl bootout "gui/$(id -u)/dev.mini.dispatch" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$plist"
+  say "dispatcher installed on the mini"
+}
+
+usage() {
+  cat <<'EOF'
+mini — run Claude or Codex tasks on the Mac mini
+
+  mini send [--agent claude|codex] [--model M] [--effort E] [--repo PATH]
+            [--branch B] [--title T] "task"      send a task ("-" reads stdin)
+  mini ls [N]              recent tasks and their state
+  mini attach [ID]         watch / steer a task (Ctrl-A then D to detach)
+  mini result [ID]         the summary the agent wrote when it finished
+  mini log [ID]            the pull / install output before the agent started
+  mini stop ID             end a task
+  mini clean               remove finished tasks' worktrees with no uncommitted work
+
+  mini add-repo [PATH] [--env-only]   recreate a repo on the mini with its env files
+  mini repos                          repos set up on the mini
+  mini sync-config                    re-copy agent config, skills and memory
+  mini setup                          one-time setup (safe to re-run)
+
+Defaults: the agent you're in, its current model and effort, the repo you're
+in, and the branch you're on (when it's on origin).
+EOF
+}
+
+sub="${1:-help}"; shift || true
+case "$sub" in
+  send) cmd_send "$@" ;;
+  ls|list) cmd_ls "$@" ;;
+  attach) cmd_attach "$@" ;;
+  result) cmd_result "$@" ;;
+  log) cmd_log "$@" ;;
+  stop) cmd_stop "$@" ;;
+  clean) cmd_clean ;;
+  add-repo) cmd_add_repo "$@" ;;
+  repos) cmd_repos ;;
+  sync-config) cmd_sync_config ;;
+  setup) cmd_setup ;;
+  _dispatch) cmd__dispatch ;;
+  _run) cmd__run "$@" ;;
+  _install) install_deps "$@" ;;
+  _install-agent) cmd__install_agent ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac

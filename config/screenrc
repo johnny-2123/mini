@@ -1,0 +1,6 @@
+# screen settings for task sessions (macOS ships screen, not tmux).
+defutf8 on
+term xterm-256color
+defscrollback 20000
+startup_message off
+altscreen on
