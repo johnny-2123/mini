@@ -46,7 +46,26 @@ ref [SAL-3184: Guide, option to only guide but not record](https://linear.app/sa
 
 Never use closing words (`fixes`, `closes`, `resolves`): they move the story.
 
-## 3. Write the prompt
+## 3. Skills the session should invoke
+
+A session on the mini has the repo's skills (`.claude/skills/` rides in the
+worktree) and the user's own (`~/.claude/skills`, synced by `mini
+sync-config`). It invokes one when the prompt names it with its slash, so
+write `Invoke /clean` and say what to apply it to; a description in prose
+("keep it tidy") is not an invocation.
+
+- Any skill the notes name (`/clean`, `/pr-review-loop`, `/readability-pass`,
+  ...) goes in a **Skills** section of the prompt, one line each: the skill,
+  when to run it, what to run it on.
+- `/clean` goes in by default: it is the user's standing quality bar for any
+  work.
+- `/pr-review-loop` only when the notes ask for it. Say so plainly in the
+  prompt: it cycles the PR through its review bots and **merges into dev**
+  when a round comes back clean, so the user should expect a merge.
+- A skill the mini may not have (something installed on this machine only)
+  gets a fallback in the same line: "if /x is not available, do y".
+
+## 4. Write the prompt
 
 Fill this skeleton. Keep the user's own wording for the task where it is
 clear; add only what the session needs and the notes left implicit.
@@ -76,6 +95,10 @@ Where: <plain paths / screens>
   the PR description. Do not use fixes/closes/resolves.
 - <constraints from the notes>
 
+## Skills
+- Invoke /clean on everything you write before committing.
+- <other skills the notes named: when, and on what>
+
 ## Done means
 - <what to verify: the tests the change touches, a build per platform,
   a screen to check>
@@ -100,6 +123,7 @@ Notes:
 > @ios/SalesablyRecorder @android/SalesablyRecorder
 > In the live guided mode it only lets you run it while recording the
 > conversation. Also want option to run it and not record the conversation.
+> Run the pr review loop on it.
 
 Reply (the story's description said the customer is worried about
 conversation security and wants the option default off):
@@ -133,10 +157,16 @@ no recording.
   the PR description. Do not use fixes/closes/resolves.
 - Same behaviour and wording on both apps.
 
+## Skills
+- Invoke /clean on everything you write before committing.
+- Once the PR is open, invoke /pr-review-loop on it: address each review
+  round, and let it merge into dev when a round comes back clean.
+
 ## Done means
 - iOS builds for the simulator and Android unit tests pass, per the repo's
   own instructions.
 - Unit tests for anything touched under lib/guide or app/api/live-coach pass.
-- Reply with the branch, the PR link, and anything left for me to check.
+- Reply with the branch, the PR link, whether it merged, and anything left
+  for me to check.
 ```
 ````
