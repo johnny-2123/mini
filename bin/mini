@@ -223,6 +223,36 @@ cmd_clean() {
   done
 }
 
+# Claude Code's WorktreeCreate hook (registered in ~/.claude/settings.json, so
+# it runs on both machines): a Remote Control session started from claude.ai
+# with `claude rc --spawn=worktree`, or EnterWorktree, gets a worktree in
+# $STATE/worktrees with the repo's ignored files copied and dependencies
+# installed, so it can run tests and the app right away. Reads Claude's JSON on
+# stdin; stdout must be the worktree path and nothing else. `mini clean`
+# removes these once they hold no uncommitted work.
+cmd__worktree_create() {
+  local repo branch name main target
+  read -r repo branch name < <(python3 -c '
+import json, sys
+i = json.load(sys.stdin)
+print(i["git_repo_path"], i.get("branch") or "-", i["worktree_name"])')
+  [[ "$branch" == "-" ]] && branch=""
+  # The main checkout, even when the session is itself inside a worktree.
+  main="$(git -C "$repo" worktree list --porcelain | sed -n '1s/^worktree //p')"
+  target="$STATE/worktrees/$name"
+  mkdir -p "$STATE/worktrees"
+  {
+    if [[ -n "$branch" ]] && git -C "$main" show-ref --verify --quiet "refs/heads/$branch"; then
+      git -C "$main" worktree add "$target" "$branch"
+    elif [[ -n "$branch" ]]; then git -C "$main" worktree add -b "$branch" "$target"
+    else git -C "$main" worktree add --detach "$target"; fi
+    copy_ignored "$main" "$target"
+    install_deps "$target"
+    [[ -f "$target/prisma/schema.prisma" ]] && ( cd "$target" && npx prisma generate )
+  } >&2
+  echo "$target"
+}
+
 # ---------------------------------------------------------------- repos
 # Gitignored files worth copying: env files, local settings, keys. Skips
 # build output (config/skip-ignored.txt) and anything over MAX_IGNORED_MB.
@@ -426,7 +456,7 @@ mini — run Claude or Codex tasks on the Mac mini
   mini result [ID]         the summary the agent wrote when it finished
   mini log [ID]            the pull / install output before the agent started
   mini stop ID             end a task
-  mini clean               remove finished tasks' worktrees with no uncommitted work
+  mini clean               remove finished tasks' and Remote Control worktrees with no uncommitted work
 
   mini add-repo [PATH|--all] [--env-only]
                            recreate a repo (or every listed repo) on the mini
@@ -459,6 +489,7 @@ case "$sub" in
   _dispatch) cmd__dispatch ;;
   _run) cmd__run "$@" ;;
   _install) install_deps "$@" ;;
+  _worktree-create) cmd__worktree_create ;;
   _install-agent) cmd__install_agent ;;
   help|-h|--help) usage ;;
   *) usage; exit 1 ;;

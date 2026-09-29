@@ -38,6 +38,21 @@ link`) links them into `~/.claude/skills` and `~/.codex/skills`.
   sync-config` mirrors; Claude memory and user MCP servers are merged in too.
   `config/skip-ignored.txt` lists the gitignored files `add-repo` never copies.
 
+## Starting sessions from claude.ai
+
+Besides `mini send`, the mini can host sessions you start from the Claude app
+or claude.ai: on the mini, run `claude rc --spawn=worktree` inside a repo and
+leave it running. Each session you spawn gets its own worktree, so several
+can work on separate PRs at once.
+
+Claude Code creates those worktrees through `mini _worktree-create`, the
+`WorktreeCreate` hook in `~/.claude/settings.json` (which `mini sync-config`
+carries to the mini). It puts the worktree in `~/.mini/worktrees/`, copies the
+repo's ignored files (env files, local settings) the same way `add-repo` does,
+installs dependencies, and prints the path. `mini clean` removes those worktrees
+too once they hold no uncommitted work. Sessions in a repo's main checkout
+(`--spawn=same-dir`) don't need any of this.
+
 ## Mac mini requirements
 
 - Stay logged in to the desktop as `johnnyavila`, because tasks run in that
