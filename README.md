@@ -84,3 +84,29 @@ The `mini-new-machine` skill walks through both cases. Ask Claude or Codex to
 - To send a new task, use an ssh app over Tailscale, connect to `mac-mini` and
   run `mini send --agent claude --repo ~/Developer/<repo> "…"`. The same
   commands work on the mini itself.
+
+## Troubleshooting a task that can't reach GitHub
+
+Verified 2026-09-30 from inside a Codex task the runner launched: DNS and
+HTTPS to github.com and api.github.com work, `gh` is signed in with push
+rights, and the task pushed a branch and opened a PR with no approval prompt.
+The runner starts Codex with `--dangerously-bypass-approvals-and-sandbox`, so
+the session has no sandbox and no network restriction. `gh` keeps its token in
+`~/.config/gh/hosts.yml` (signed in with `--insecure-storage`), so the login
+keychain is never needed, and `gh auth setup-git` is the git credential helper.
+
+- **`Could not resolve host` from `git push` or `gh` inside Codex** means that
+  session is sandboxed with networking off. Check `env | grep CODEX_SANDBOX`:
+  `CODEX_SANDBOX=seatbelt` plus `CODEX_SANDBOX_NETWORK_DISABLED=1` is a
+  sandboxed session (a Codex session on the MacBook, not a mini task). Fix how
+  that session was launched, not gh or git.
+- **A network error from `gh auth status`** is not proof the token is bad; test
+  DNS and HTTPS first.
+- **A task that exits seconds after starting with no result**: read the error
+  in `~/.codex/sessions/<date>/rollout-*.jsonl`. One exited because the model
+  was passed as `astra` instead of `gpt-6-astra`.
+- **A task that is queued but never starts**: on the mini,
+  `launchctl print gui/$(id -u)/dev.mini.dispatch` and `~/.mini/dispatch.log`.
+- **Every task lands in `~/.mini/worktrees/<id>`** even when the main checkout
+  is idle: a finished task's `screen` session is still alive (the agent's UI
+  stays up), so `_run` counts the checkout as in use. `mini stop <old id>`.
