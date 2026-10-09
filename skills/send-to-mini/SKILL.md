@@ -59,4 +59,5 @@ user can follow and reply from their phone.
 
 When two tasks target the same repo, the second runs in its own git worktree
 on a `mini/<id>` branch, so they never overwrite each other. `mini clean`
-removes finished worktrees that have no uncommitted work.
+ends the sessions of finished tasks and removes their worktrees when they hold
+no uncommitted work.

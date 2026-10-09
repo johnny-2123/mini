@@ -209,10 +209,19 @@ cmd_log() { local id="${1:-$(latest_id)}"; on_mini "cat \$HOME/.mini/tasks/$(q "
 cmd_result() { local id="${1:-$(latest_id)}"; on_mini "cat \$HOME/.mini/tasks/$(q "$id")/result.md 2>/dev/null || echo 'no summary yet — mini attach $id'"; }
 cmd_stop() { [[ -n "${1:-}" ]] || die "mini stop <id>"; on_mini "screen -S mini-$(q "$1") -X quit"; say "stopped $1"; }
 
-# Remove worktrees of finished tasks that hold no uncommitted work.
+# End the agent sessions of finished tasks, then remove worktrees of finished
+# tasks that hold no uncommitted work. A task's screen session stays open after
+# the agent writes its summary so `mini attach` can still steer it, which is
+# why it is only ended here: once there is a result.md the session has done its
+# job, and each one left open keeps an idle agent process alive for weeks.
 cmd_clean() {
-  if ! is_host; then mini_there clean; return; fi
-  local wt id running; running=" $(running_ids | tr '\n' ' ') "
+  if ! is_host; then cmd_push_self; mini_there clean; return; fi
+  local wt id running
+  for id in $(running_ids); do
+    [[ -f "$STATE/tasks/$id/result.md" ]] || continue
+    screen -S "mini-$id" -X quit && say "ended session $id (finished)"
+  done
+  running=" $(running_ids | tr '\n' ' ') "
   for wt in "$STATE"/worktrees/*; do
     [[ -d "$wt" ]] || continue
     id="$(basename "$wt")"
@@ -456,7 +465,7 @@ mini — run Claude or Codex tasks on the Mac mini
   mini result [ID]         the summary the agent wrote when it finished
   mini log [ID]            the pull / install output before the agent started
   mini stop ID             end a task
-  mini clean               remove finished tasks' and Remote Control worktrees with no uncommitted work
+  mini clean               end finished tasks' sessions; remove their and Remote Control worktrees with no uncommitted work
 
   mini add-repo [PATH|--all] [--env-only]
                            recreate a repo (or every listed repo) on the mini

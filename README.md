@@ -50,7 +50,9 @@ Claude Code creates those worktrees through `mini _worktree-create`, the
 carries to the mini). It puts the worktree in `~/.mini/worktrees/`, copies the
 repo's ignored files (env files, local settings) the same way `add-repo` does,
 installs dependencies, and prints the path. `mini clean` removes those worktrees
-too once they hold no uncommitted work. Sessions in a repo's main checkout
+too once they hold no uncommitted work, after ending the sessions of tasks that
+have written their summary (a finished task's session stays open until then, so
+`mini attach` can still steer it). Sessions in a repo's main checkout
 (`--spawn=same-dir`) don't need any of this.
 
 ## Mac mini requirements
