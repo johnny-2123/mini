@@ -34,7 +34,10 @@ repo_root() { git -C "${1:-.}" rev-parse --show-toplevel 2>/dev/null || die "${1
 config_list() { grep -vE '^\s*(#|$)' "$MINI_DIR/config/$1"; }
 
 # ---------------------------------------------------------------- defaults
-# Model and effort a tool is set to right now, read from its own config.
+# Model a tool is set to right now, read from its own config. Effort defaults
+# to medium: a task on the mini runs unattended, and the interactive session's
+# effort (often xhigh) is not what it should inherit.
+DEFAULT_EFFORT=medium
 toml_top() { awk -F' *= *' -v k="$2" '/^\[/{exit} $1==k{gsub(/"/,"",$2); print $2}' "$1" 2>/dev/null || true; }
 json_key() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2],""))' "$1" "$2" 2>/dev/null || true; }
 default_model() {
@@ -43,12 +46,7 @@ default_model() {
     codex) toml_top "$HOME/.codex/config.toml" model ;;
   esac
 }
-default_effort() {
-  case "$1" in
-    claude) json_key "$HOME/.claude/settings.json" effortLevel ;;
-    codex) toml_top "$HOME/.codex/config.toml" model_reasoning_effort ;;
-  esac
-}
+default_effort() { echo "$DEFAULT_EFFORT"; }
 detect_agent() {
   if [[ -n "${CLAUDECODE:-}" ]]; then echo claude
   elif [[ -n "${CODEX_THREAD_ID:-}${CODEX_SANDBOX:-}${CODEX_MANAGED_BY_NPM:-}" ]]; then echo codex
@@ -188,18 +186,66 @@ EOF
   echo exited > "$task/state"
 }
 
+# One row per task, newest first: state, start time, title, agent, model,
+# effort, id. Columns fit their contents; REPO appears only when the listed
+# tasks span more than one repo. Colour only when a terminal is reading.
 cmd_ls() {
-  if ! is_host; then mini_there ls "$@"; return; fi
-  local running id meta state
+  local color=""
+  if [[ "${1:-}" == --color ]]; then color=1; shift; fi
+  if ! is_host; then
+    if [[ -t 1 ]]; then mini_there ls --color "$@"; else mini_there ls "$@"; fi
+    return
+  fi
+  [[ -t 1 ]] && color=1
+  local running meta id state started months=(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec)
   running=" $(running_ids | tr '\n' ' ') "
-  printf '%-36s %-7s %-9s %-22s %s\n' ID AGENT STATE REPO TASK
+  local -a S T N A M E R I
   for meta in $(ls -1dt "$STATE"/tasks/*/meta 2>/dev/null | head -"${1:-15}"); do
     id="$(basename "$(dirname "$meta")")"
-    ( source "$meta"
-      state="$(cat "$STATE/tasks/$id/state" 2>/dev/null || echo queued)"
-      if [[ "$running" != *" $id "* && ( "$state" == running || "$state" == preparing ) ]]; then state=stopped; fi
-      if [[ -f "$STATE/tasks/$id/result.md" ]]; then state="done"; fi
-      printf '%-36s %-7s %-9s %-22s %s\n' "$id" "$AGENT" "$state" "$(basename "$REPO")" "$TITLE" )
+    local AGENT="" MODEL="" EFFORT="" REPO="" TITLE=""
+    source "$meta"
+    state="$(cat "$STATE/tasks/$id/state" 2>/dev/null || echo queued)"
+    if [[ "$running" != *" $id "* && ( "$state" == running || "$state" == preparing ) ]]; then state=stopped; fi
+    if [[ -f "$STATE/tasks/$id/result.md" ]]; then state="done"; fi
+    # The id starts with MMDD-HHMMSS.
+    started="${months[$((10#${id:0:2} - 1))]} $((10#${id:2:2})) ${id:5:2}:${id:7:2}"
+    S+=("$state"); T+=("$started"); N+=("$TITLE"); A+=("$AGENT")
+    M+=("${MODEL:-default}"); E+=("${EFFORT:-default}"); R+=("$(basename "$REPO")"); I+=("$id")
+  done
+  [[ ${#I[@]} -gt 0 ]] || { echo "no tasks yet"; return; }
+
+  local w_s=5 w_t=7 w_n=4 w_a=5 w_m=5 w_e=6 w_r=4 i show_repo=""
+  for i in "${!I[@]}"; do
+    (( ${#S[i]} > w_s )) && w_s=${#S[i]}; (( ${#T[i]} > w_t )) && w_t=${#T[i]}
+    (( ${#N[i]} > w_n )) && w_n=${#N[i]}; (( ${#A[i]} > w_a )) && w_a=${#A[i]}
+    (( ${#M[i]} > w_m )) && w_m=${#M[i]}; (( ${#E[i]} > w_e )) && w_e=${#E[i]}
+    (( ${#R[i]} > w_r )) && w_r=${#R[i]}
+    [[ "${R[i]}" != "${R[0]}" ]] && show_repo=1
+  done
+
+  local bold="" dim="" off="" green="" yellow="" red=""
+  if [[ -n "$color" ]]; then
+    bold=$'\e[1m' dim=$'\e[2m' off=$'\e[0m' green=$'\e[32m' yellow=$'\e[33m' red=$'\e[31m'
+  fi
+  row() { # dot-colour state started title agent model effort repo id
+    printf '%s●%s %-*s  %-*s  %s%-*s%s  %-*s  %-*s  %-*s  ' "$1" "$off" "$w_s" "$2" "$w_t" "$3" \
+      "$bold" "$w_n" "$4" "$off" "$w_a" "$5" "$w_m" "$6" "$w_e" "$7"
+    [[ -n "$show_repo" ]] && printf '%-*s  ' "$w_r" "$8"
+    printf '%s%s%s\n' "$dim" "$9" "$off"
+  }
+  printf '%s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s  ' "$dim" "$w_s" STATE "$w_t" STARTED "$w_n" TASK \
+    "$w_a" AGENT "$w_m" MODEL "$w_e" EFFORT
+  [[ -n "$show_repo" ]] && printf '%-*s  ' "$w_r" REPO
+  printf 'ID%s\n' "$off"
+  local dot
+  for i in "${!I[@]}"; do
+    case "${S[i]}" in
+      running|preparing) dot="$green" ;;
+      stopped|queued) dot="$yellow" ;;
+      exited) dot="$red" ;;
+      *) dot="$dim" ;;
+    esac
+    row "$dot" "${S[i]}" "${T[i]}" "${N[i]}" "${A[i]}" "${M[i]}" "${E[i]}" "${R[i]}" "${I[i]}"
   done
 }
 
@@ -460,7 +506,7 @@ mini — run Claude or Codex tasks on the Mac mini
 
   mini send [--agent claude|codex] [--model M] [--effort E] [--repo PATH]
             [--branch B] [--title T] "task"      send a task ("-" reads stdin)
-  mini ls [N]              recent tasks and their state
+  mini ls [N]              last N tasks (default 15): state, model, effort, id
   mini attach [ID]         watch / steer a task (Ctrl-A then D to detach)
   mini result [ID]         the summary the agent wrote when it finished
   mini log [ID]            the pull / install output before the agent started
@@ -476,8 +522,8 @@ mini — run Claude or Codex tasks on the Mac mini
   mini link                put mini and its skills on this machine's PATH
   mini setup [USER@HOST]   set up a mini (safe to re-run); a host switches to a new mini
 
-Defaults: the agent you're in, its current model and effort, the repo you're
-in, and the branch you're on (when it's on origin).
+Defaults: the agent you're in, its current model, medium effort, the repo
+you're in, and the branch you're on (when it's on origin).
 EOF
 }
 

@@ -1,6 +1,6 @@
 ---
 name: send-to-mini
-description: Send a coding task to the Mac mini so it runs there instead of on this MacBook, in the same agent (Claude or Codex) with the same model and effort. Use when the user says "send this to the mini", "have the mini do X", "run this on the Mac mini", "offload this", or asks to check on, watch or stop a task running on the mini.
+description: Send a coding task to the Mac mini so it runs there instead of on this MacBook, in the same agent (Claude or Codex) with the same model, at medium effort unless told otherwise. Use when the user says "send this to the mini", "have the mini do X", "run this on the Mac mini", "offload this", or asks to check on, watch or stop a task running on the mini.
 ---
 
 # Send a task to the Mac mini
@@ -32,10 +32,9 @@ TASK
 - `--model`: your exact model ID as your system prompt states it (for
   example `claude-opus-5-5[1m]`, or the Codex model name). Leave it out only
   if you don't know it; `mini` then reads the tool's configured default.
-- `--effort`: pass it when you know the session's effort level. Otherwise
-  leave it out: `mini` reads the effort the tool is configured with
-  (`effortLevel` in `~/.claude/settings.json`, `model_reasoning_effort` in
-  `~/.codex/config.toml`), which is what `/effort` and `/model` set.
+- `--effort`: leave it out unless the user asks for a level; the default is
+  `medium`. A task on the mini runs unattended and should not inherit the
+  interactive session's effort, which is often xhigh.
 - The mini follows the branch this checkout is on when origin has it,
   otherwise the mini's current branch. Use `--branch` to choose another.
 - Codex: the command uses the network (ssh), so run it with escalated
