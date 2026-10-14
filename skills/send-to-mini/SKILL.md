@@ -30,8 +30,12 @@ TASK
 
 - `--agent`: `claude` if you are Claude Code, `codex` if you are Codex.
 - `--model`: your exact model ID as your system prompt states it (for
-  example `claude-opus-5-5[1m]`, or the Codex model name). Leave it out only
+  example `claude-opus-5-5[1m]`, or Codex's full id such as `gpt-6-astra`,
+  never a short name like `astra`, which Codex rejects). Leave it out only
   if you don't know it; `mini` then reads the tool's configured default.
+  For Codex, `mini send` checks the name against the models Codex has cached:
+  a short name with exactly one match becomes the full id, and an unknown or
+  ambiguous name stops the send and lists the valid ids.
 - `--effort`: leave it out unless the user asks for a level; the default is
   `medium`. A task on the mini runs unattended and should not inherit the
   interactive session's effort, which is often xhigh.

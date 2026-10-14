@@ -47,6 +47,30 @@ default_model() {
   esac
 }
 default_effort() { echo "$DEFAULT_EFFORT"; }
+# Codex only accepts a model's full id ("gpt-6-astra"), and a wrong one fails on
+# the mini after the task has started. Check it here against the ids this Codex
+# login has cached: a short name ("astra", "GPT-6-Astra") that matches exactly
+# one id is expanded to it, and anything else stops the send.
+resolve_codex_model() {
+  local cache="$HOME/.codex/models_cache.json"
+  [[ -f "$cache" ]] || { echo "$1"; return; }
+  python3 - "$cache" "$1" <<'PY'
+import json, sys
+models = json.load(open(sys.argv[1])).get("models", [])
+want = sys.argv[2].lower()
+slugs = [m["slug"] for m in models if m.get("slug")]
+if not slugs:
+    print(sys.argv[2]); sys.exit()
+if want in slugs:
+    print(want); sys.exit()
+hits = [m["slug"] for m in models if m.get("slug") and (
+    (m.get("display_name") or "").lower() == want or m["slug"].endswith("-" + want))]
+if len(hits) == 1:
+    print(hits[0]); sys.exit()
+sys.exit(f"codex has no model '{sys.argv[2]}'" + (f" (ambiguous: {', '.join(hits)})" if hits else "")
+         + f"; use one of: {', '.join(slugs)}")
+PY
+}
 detect_agent() {
   if [[ -n "${CLAUDECODE:-}" ]]; then echo claude
   elif [[ -n "${CODEX_THREAD_ID:-}${CODEX_SANDBOX:-}${CODEX_MANAGED_BY_NPM:-}" ]]; then echo codex
@@ -74,6 +98,7 @@ cmd_send() {
   agent="${agent:-$(detect_agent)}"
   [[ "$agent" == claude || "$agent" == codex ]] || die "--agent must be claude or codex"
   model="${model:-$(default_model "$agent")}"
+  if [[ "$agent" == codex && -n "$model" ]]; then model="$(resolve_codex_model "$model")" || exit 1; fi
   effort="${effort:-$(default_effort "$agent")}"
   repo="$(repo_root "${repo:-.}")"
   if [[ -z "$branch" ]]; then
